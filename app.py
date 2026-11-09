@@ -26,18 +26,30 @@ import soundfile as sf
 from scipy import signal
 
 # ------------------------------------------------------------
-# テキスト正規化・スキャット判定ユーティリティ
+# 音韻（よみがな＋母音骨格）正規化・類似度ユーティリティ
 # ------------------------------------------------------------
 
-SCAT_PATTERNS = re.compile(
-    r"^[\s\W_]*("
-    r"ah+|oh+|uh+|oo+h*|wo+h*|ye+a*h*|yo+|na+[\s\-]*na+|la+[\s\-]*la+|"
-    r"da+[\s\-]*da+|ba+[\s\-]*ba+|sha+[\s\-]*la+|mm+|hm+|hu+h*|"
-    r"アー+|オー+|ウー+|イェー+イ*|イェイ+|ララ+|ナナ+|ルル+|フー+|ハァ+|フフ+|"
-    r"yeah|woo|baby|come on|let's go|check it|one two"
-    r")[\s\W_]*$",
-    re.IGNORECASE,
-)
+import difflib
+import pykakasi
+
+_KKS = pykakasi.kakasi()
+
+_HIRA_NORM = {
+    "ぁ": "あ", "ぃ": "い", "ぅ": "う", "ぇ": "え", "ぉ": "お",
+    "っ": "", "ー": "", "づ": "ず", "ぢ": "じ", "を": "お", "は": "わ",
+}
+
+_VOWEL_MAP = {}
+for _v, _chars in [
+    ("a", "あかさたなはまやらわがざだばぱゃ"),
+    ("i", "いきしちにひみりぎじぢびぴ"),
+    ("u", "うくすつぬふむゆるぐずづぶぷゅ"),
+    ("e", "えけせてねへめれげぜでべぺ"),
+    ("o", "おこそとのほもよろをごぞどぼぽょ"),
+    ("n", "ん"),
+]:
+    for _c in _chars:
+        _VOWEL_MAP[_c] = _v
 
 
 def kata_to_hira(text: str) -> str:
@@ -53,23 +65,35 @@ def kata_to_hira(text: str) -> str:
 
 
 def normalize_for_match(text: str) -> str:
-    """比較用に記号・空白を除去し、英字小文字・ひらがな化"""
-    t = kata_to_hira(text.lower())
-    t = re.sub(r"[\s\W_、。！？!?,.\-〜～「」『』（）()【】\[\]\/｜|＊*]+", "", t)
-    return t
+    """漢字・カタカナ・英数字をひらがな読み（音韻）に正規化"""
+    if not text:
+        return ""
+    items = _KKS.convert(text)
+    hira = "".join(it["hira"] for it in items).lower()
+    hira = kata_to_hira(hira)
+    hira = re.sub(r"[^ぁ-んa-z0-9]", "", hira)
+    return "".join(_HIRA_NORM.get(c, c) for c in hira)
+
+
+def to_vowels(phonetic_hira: str) -> str:
+    """ひらがな音韻列から母音骨格(a/i/u/e/o/n)を抽出"""
+    return "".join(_VOWEL_MAP.get(c, c) for c in phonetic_hira)
+
+
+def phonetic_similarity(p_lyr: str, v_lyr: str, p_asr: str, v_asr: str) -> float:
+    """よみがな一致度(65%)と母音骨格一致度(35%)のハイブリッド音韻類似度"""
+    if not p_lyr or not p_asr:
+        return 0.0
+    s_hira = difflib.SequenceMatcher(None, p_lyr, p_asr).ratio()
+    s_vow = difflib.SequenceMatcher(None, v_lyr, v_asr).ratio()
+    return s_hira * 0.65 + s_vow * 0.35
 
 
 def char_overlap_ratio(seg_text: str, lyrics_norm: str) -> float:
-    """認識セグメントの文字が歌詞全体とどの程度重なっているかを返す (0.0〜1.0)"""
+    """認識セグメントの音韻が歌詞全体とどの程度重なっているかを返す (0.0〜1.0)"""
     s = normalize_for_match(seg_text)
     if not s:
         return 0.0
-    if SCAT_PATTERNS.match(seg_text.strip()):
-        # もし歌詞自体にも同じスキャットが含まれているなら残す
-        if s in lyrics_norm:
-            return 1.0
-        return 0.0
-    # 2-gram または 1-gram の一致率
     if len(s) >= 2:
         bigrams = [s[i : i + 2] for i in range(len(s) - 1)]
         hits = sum(1 for bg in bigrams if bg in lyrics_norm)
@@ -293,111 +317,229 @@ class LRCMakerEngine:
         rms, dt = compute_rms_envelope(vocal_band_16k, sr=sr, hop_ms=10, win_ms=30)
         audio_duration = round(len(raw_16k) / sr, 2)
 
-        # 2. Whisper によるトランスクリプション実行
-        # 歌詞の冒頭を initial_prompt に渡して漢字や発音の認識率を最大化
-        prompt_plain = " ".join([ln.replace("/", "") for ln in lyric_lines[:20]])
-        prompt_text = "歌詞: " + prompt_plain[:240]
-
-        transcribe_opts = {
+        # 2. Whisper デュアルパス・トランスクリプション
+        # - Pass 1 (vad=False): 音圧の高い2ミックス区間でもSilero VADの誤無音スキップを起こさず最後まで認識
+        # - Pass 2 (vad=True): イントロのスキャット等で起きるハルシネーションを回避して曲頭をクリアに認識
+        # ※ initial_prompt はイントロでのプロンプト反復ハルシネーションの原因になるため使用しない
+        base_opts = {
             "language": lang,
-            "initial_prompt": prompt_text,
             "word_timestamps": True,
             "suppress_silence": True,
-            "vad": True,
+            "no_speech_threshold": None,
+            "logprob_threshold": None,
+            "compression_ratio_threshold": 2.4,
+            "condition_on_previous_text": False,
             "verbose": False,
         }
         if use_demucs:
-            try:
-                transcribe_opts["demucs"] = True
-            except Exception:
-                pass
+            base_opts["denoiser"] = "demucs"
 
-        print(f"[LRC Maker] Transcribing audio with Whisper (VAD=True)...")
-        asr_res = self.model.transcribe(audio_path, **transcribe_opts)
+        print("[LRC Maker] Pass 1/2: Transcribing full audio (vad=False)...")
+        res_no_vad = self.model.transcribe(audio_path, vad=False, **base_opts)
+        print("[LRC Maker] Pass 2/2: Transcribing vocal segments (vad=True)...")
+        res_vad = self.model.transcribe(audio_path, vad=True, **base_opts)
 
-        # 3. 認識された単語列のフラット化
+        def healthy_segments(res) -> List:
+            out = []
+            for seg in res.segments:
+                txt = (seg.text or "").strip()
+                p = normalize_for_match(txt)
+                dur = float(seg.end) - float(seg.start)
+                if not p or dur <= 0.05:
+                    continue
+                # 6秒以上で文字密度が極端に低い崩壊セグメント（例: 15秒間で「た」1文字）を除外
+                if dur >= 6.0 and (len(p) / dur) < 1.2:
+                    continue
+                # 同一2文字の異常反復（Bi-Bi-Bi...）を除外
+                if len(p) >= 12 and len(set(p)) <= 3:
+                    continue
+                out.append(seg)
+            return out
+
+        segs_1 = healthy_segments(res_no_vad)
+        segs_2 = healthy_segments(res_vad)
+
+        # 30秒チャンクごとに健全な音韻文字数が多い方のパスを主採用し、もう一方で空白を補完
+        merged_segs = []
+        chunk_size = 29.3
+        num_chunks = max(1, int(np.ceil(audio_duration / chunk_size)))
+        for c_idx in range(num_chunks):
+            c_start = c_idx * chunk_size
+            c_end = (c_idx + 1) * chunk_size
+            c1 = [s for s in segs_1 if c_start <= 0.5 * (float(s.start) + float(s.end)) < c_end]
+            c2 = [s for s in segs_2 if c_start <= 0.5 * (float(s.start) + float(s.end)) < c_end]
+            len1 = sum(len(normalize_for_match(s.text)) for s in c1)
+            len2 = sum(len(normalize_for_match(s.text)) for s in c2)
+            primary, secondary = (c2, c1) if len2 > len1 * 1.15 else (c1, c2)
+            chosen = list(primary)
+            for s_sec in secondary:
+                overlaps = any(
+                    max(float(s_sec.start), float(m.start)) < min(float(s_sec.end), float(m.end)) - 0.15
+                    for m in chosen
+                )
+                if not overlaps:
+                    chosen.append(s_sec)
+            merged_segs.extend(chosen)
+
+        merged_segs.sort(key=lambda s: float(s.start))
+
+        # 3. 認識ユニット列（単語・文節粒度）の抽出
         asr_words: List[dict] = []
-        for seg in asr_res.segments:
-            if seg.words:
+        for seg in merged_segs:
+            if seg.words and len(seg.words) > 1:
                 for w in seg.words:
                     w_txt = (w.word or "").strip()
-                    if w_txt:
+                    p = normalize_for_match(w_txt)
+                    if p and float(w.end) > float(w.start):
                         asr_words.append({
                             "word": w_txt,
+                            "p": p,
                             "start": round(float(w.start), 3),
                             "end": round(float(w.end), 3),
                             "used": False,
                         })
             else:
                 seg_txt = (seg.text or "").strip()
-                if seg_txt:
+                p = normalize_for_match(seg_txt)
+                if p:
                     asr_words.append({
                         "word": seg_txt,
+                        "p": p,
                         "start": round(float(seg.start), 3),
                         "end": round(float(seg.end), 3),
                         "used": False,
                     })
 
-        if not asr_words:
-            # 万が一無音などで検出されなかった場合、均等配分フォールバック
-            step = audio_duration / (len(lyric_lines) + 1)
-            asr_words = [
-                {"word": ln, "start": (i + 1) * step, "end": (i + 1) * step + step * 0.7, "used": False}
-                for i, ln in enumerate(lyric_lines)
-            ]
+        # 4. 大域的動的計画法（Global DP）による歌詞行と音韻ユニットの最適アライメント
+        N = len(lyric_lines)
+        M = len(asr_words)
+        lyr_p = [normalize_for_match(ln.replace("/", "")) or ln.lower() for ln in lyric_lines]
+        lyr_v = [to_vowels(p) for p in lyr_p]
 
-        # 4. 歌詞行と認識単語列のシーケンシャル最適アライメント
-        cur_word_idx = 0
-        raw_aligned: List[dict] = []
+        matches: List[Optional[Tuple[float, float, float, List[int]]]] = [None] * N
+        if M > 0:
+            max_span = 14
+            dp = np.full((N + 1, M + 1), -1e9, dtype=np.float64)
+            back: dict = {}
+            dp[0, :] = 0.0  # 1行目の前にあるイントロのスキャットはコスト0で任意個スキップ可能
 
-        for line_idx, raw_line in enumerate(lyric_lines):
-            clean_line = raw_line.replace("/", "").strip()
-            target = normalize_for_match(clean_line)
-            if not target:
-                target = clean_line.lower()
+            for i in range(N):
+                lp, lv = lyr_p[i], lyr_v[i]
+                for a in range(M):
+                    # 行と行の間にある間奏スキャット・非歌詞トークンをスキップする遷移
+                    if i > 0 and dp[i, a] - 0.015 > dp[i, a + 1]:
+                        dp[i, a + 1] = dp[i, a] - 0.015
+                        back[(i, a + 1)] = ("skip_unit", i, a)
+                    if dp[i, a] <= -1e8:
+                        continue
+                    concat_p = ""
+                    for b in range(a, min(M, a + max_span)):
+                        if b > a and (asr_words[b]["start"] - asr_words[b - 1]["end"]) > 2.5:
+                            break  # 2.5秒以上の間奏をまたいで1行に結合しない
+                        if (asr_words[b]["end"] - asr_words[a]["start"]) > 6.5:
+                            break  # 1行の最大長上限
+                        concat_p += asr_words[b]["p"]
+                        concat_v = to_vowels(concat_p)
+                        sim = phonetic_similarity(lp, lv, concat_p, concat_v)
+                        len_ratio = min(len(lp), len(concat_p)) / max(len(lp), len(concat_p), 1)
+                        score = sim * (0.75 + 0.25 * len_ratio)
+                        cand = dp[i, a] + score
+                        if cand > dp[i + 1, b + 1]:
+                            dp[i + 1, b + 1] = cand
+                            back[(i + 1, b + 1)] = ("match", i, a, b, score)
+                # 万が一ASRが完全に聞き落とした行をスキップ（後で前後アンカーから内挿）する遷移
+                for m_idx in range(M + 1):
+                    cand = dp[i, m_idx] + 0.22
+                    if cand > dp[i + 1, m_idx]:
+                        dp[i + 1, m_idx] = cand
+                        back[(i + 1, m_idx)] = ("miss_line", i, m_idx)
 
-            best_score = -1.0
-            best_range = (cur_word_idx, cur_word_idx)
+            best_m = int(np.argmax(dp[N, :]))
+            cur_i, cur_m = N, best_m
+            while cur_i > 0 and (cur_i, cur_m) in back:
+                step = back[(cur_i, cur_m)]
+                if step[0] == "skip_unit":
+                    _, prev_i, prev_m = step
+                    cur_i, cur_m = prev_i, prev_m
+                elif step[0] == "match":
+                    _, prev_i, a, b, sc = step
+                    matches[prev_i] = (
+                        asr_words[a]["start"],
+                        asr_words[b]["end"],
+                        sc,
+                        list(range(a, b + 1)),
+                    )
+                    for k in range(a, b + 1):
+                        asr_words[k]["used"] = True
+                    cur_i, cur_m = prev_i, a
+                elif step[0] == "miss_line":
+                    _, prev_i, prev_m = step
+                    matches[prev_i] = None
+                    cur_i, cur_m = prev_i, prev_m
 
-            # 現在位置から先の単語ウィンドウ内で最も一致率が高い区間を探す
-            max_search = min(len(asr_words), cur_word_idx + 45)
-            for i in range(cur_word_idx, max_search):
-                concat = ""
-                for j in range(i, min(len(asr_words), i + 18)):
-                    concat += normalize_for_match(asr_words[j]["word"])
-                    sm = difflib.SequenceMatcher(None, target, concat)
-                    score = sm.ratio()
-                    if score > best_score:
-                        best_score = score
-                        best_range = (i, j)
-                    # 充分に高く文字数も満たしていれば探索早期終了
-                    if score >= 0.88 and len(concat) >= len(target) * 0.85:
-                        break
-                if best_score >= 0.95:
-                    break
+        # 未マッチ行があれば前後のアンカー行から内挿・逆算補間
+        raw_aligned: List[dict] = [None] * N  # type: ignore
+        for i in range(N):
+            if matches[i] is not None:
+                s_t, e_t, sc, _ = matches[i]  # type: ignore
+                raw_aligned[i] = {
+                    "index": i,
+                    "text": lyric_lines[i],
+                    "start": round(s_t, 3),
+                    "end": round(max(s_t + 0.20, e_t), 3),
+                    "score": sc,
+                }
 
-            # 一致スコアが基準値以上の場合はその区間を採用、スキャット等はスキップされる
-            if best_score >= 0.28 and best_range[0] < len(asr_words):
-                s_idx, e_idx = best_range
-                s_time = asr_words[s_idx]["start"]
-                e_time = asr_words[e_idx]["end"]
-                # 使用した単語にマーク
-                for k in range(s_idx, e_idx + 1):
-                    asr_words[k]["used"] = True
-                cur_word_idx = e_idx + 1
+        i = 0
+        while i < N:
+            if raw_aligned[i] is not None:
+                i += 1
+                continue
+            j = i
+            while j < N and raw_aligned[j] is None:
+                j += 1
+            count = j - i
+            prev_end = raw_aligned[i - 1]["end"] if i > 0 else None
+            next_start = raw_aligned[j]["start"] if j < N else None
+            if prev_end is None and next_start is not None:
+                # 先頭側が未マッチなら直後のアンカー行から逆算配置
+                total_need = count * 2.6
+                base_t = max(0.5, next_start - total_need)
+                step_t = max(0.5, (next_start - base_t) / count)
+                for k in range(i, j):
+                    st = base_t + (k - i) * step_t
+                    raw_aligned[k] = {
+                        "index": k,
+                        "text": lyric_lines[k],
+                        "start": round(st, 3),
+                        "end": round(st + step_t * 0.85, 3),
+                        "score": 0.0,
+                    }
+            elif prev_end is not None and next_start is not None:
+                # 前後アンカー間の均等内挿
+                room = max(count * 0.4, next_start - prev_end - 0.2)
+                step_t = room / count
+                for k in range(i, j):
+                    st = prev_end + 0.1 + (k - i) * step_t
+                    raw_aligned[k] = {
+                        "index": k,
+                        "text": lyric_lines[k],
+                        "start": round(st, 3),
+                        "end": round(st + step_t * 0.85, 3),
+                        "score": 0.0,
+                    }
             else:
-                # ASRが聞き落とした行は、直前の終了時刻から自然に推定
-                prev_end = raw_aligned[-1]["end"] if raw_aligned else 1.5
-                s_time = prev_end + 0.35
-                e_time = s_time + max(1.2, len(clean_line) * 0.20)
-
-            raw_aligned.append({
-                "index": line_idx,
-                "text": raw_line,
-                "start": round(s_time, 3),
-                "end": round(max(s_time + 0.20, e_time), 3),
-                "score": best_score,
-            })
+                base_t = (prev_end + 0.4) if prev_end is not None else 1.5
+                for k in range(i, j):
+                    st = base_t + (k - i) * 2.5
+                    raw_aligned[k] = {
+                        "index": k,
+                        "text": lyric_lines[k],
+                        "start": round(st, 3),
+                        "end": round(st + 2.2, 3),
+                        "score": 0.0,
+                    }
+            i = j
 
         # 単調増加の保証（前の行より時間が戻らない）
         for i in range(1, len(raw_aligned)):
