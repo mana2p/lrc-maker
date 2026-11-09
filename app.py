@@ -888,6 +888,27 @@ class LRCHandler(BaseHTTPRequestHandler):
         self.wfile.write(raw)
 
 
+def create_server(host: str, preferred_port: int) -> Tuple[HTTPServer, int]:
+    candidate_ports = [preferred_port]
+    for p in [8765, 8080, 5000]:
+        if p not in candidate_ports:
+            candidate_ports.append(p)
+    candidate_ports.extend(range(preferred_port + 1, preferred_port + 10))
+    candidate_ports.append(0)
+
+    last_err = None
+    for port in candidate_ports:
+        try:
+            srv = HTTPServer((host, port), LRCHandler)
+            return srv, srv.server_port
+        except OSError as e:
+            last_err = e
+            continue
+    if last_err:
+        raise last_err
+    raise RuntimeError("利用可能なポートが見つかりませんでした")
+
+
 def main():
     parser = argparse.ArgumentParser(description="LRC Maker — 歌い始め・歌い終わり検出＆スキャット除去対応 LRC生成ツール")
     parser.add_argument("--audio", "-a", help="入力音源ファイル (mp3/wav/m4a/flac)")
@@ -922,9 +943,11 @@ def main():
         return
 
     # Web UI モード
-    url = f"http://127.0.0.1:{args.port}"
+    server, actual_port = create_server("127.0.0.1", args.port)
+    url = f"http://127.0.0.1:{actual_port}"
+    if actual_port != args.port:
+        print(f"※ ポート {args.port} が使用中または制限されているため、ポート {actual_port} で起動しました。")
     print(f"Starting LRC Maker Web UI at {url} ...")
-    server = HTTPServer(("127.0.0.1", args.port), LRCHandler)
     if not args.no_browser:
         threading.Timer(0.8, lambda: webbrowser.open(url)).start()
     try:
@@ -935,3 +958,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
