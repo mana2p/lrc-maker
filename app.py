@@ -233,8 +233,10 @@ def refine_line_bounds_with_rms(
 
 
 # ------------------------------------------------------------
-# Whisper / stable-ts アライメント本体
+# Whisper ASR + テキストシーケンスアライメント本体
 # ------------------------------------------------------------
+
+import difflib
 
 @dataclass
 class AlignedLine:
@@ -255,99 +257,6 @@ class LRCMakerEngine:
         print(f"[LRC Maker] Loading Whisper model '{model_name}' on {self.device}...")
         self.model = stable_whisper.load_model(model_name, device=self.device)
 
-    def mask_scats(self, audio_16k: np.ndarray, clean_lines: List[str], lang: str = "ja") -> Tuple[np.ndarray, List[dict]]:
-        """
-        事前トランスクリプションを行い、歌詞に存在しないスキャット・フェイク・MC区間を検出して
-        アライメント用オーディオ波形上で減衰（ミュート）する。
-        """
-        lyrics_norm = normalize_for_match("".join(clean_lines))
-        masked_audio = audio_16k.copy()
-        scat_regions = []
-
-        try:
-            pre = self.model.transcribe(
-                masked_audio,
-                language=lang,
-                vad=True,
-                suppress_silence=True,
-                condition_on_previous_text=False,
-                verbose=False,
-            )
-            sr = 16000
-            for seg in pre.segments:
-                seg_txt = (seg.text or "").strip()
-                if not seg_txt:
-                    continue
-                ratio = char_overlap_ratio(seg_txt, lyrics_norm)
-                # 歌詞との文字重複が20%未満、または明確なスキャット表現ならマスク
-                if ratio < 0.20:
-                    s_idx = max(0, int(seg.start * sr))
-                    e_idx = min(len(masked_audio), int(seg.end * sr))
-                    if e_idx > s_idx:
-                        masked_audio[s_idx:e_idx] *= 0.02  # -34dB減衰させてDTWの誤吸着を防止
-                        scat_regions.append({
-                            "start": round(float(seg.start), 2),
-                            "end": round(float(seg.end), 2),
-                            "text": seg_txt,
-                        })
-        except Exception as e:
-            print(f"[warn] Scat pre-masking skipped: {e}")
-
-        return masked_audio, scat_regions
-
-    @staticmethod
-    def fix_line_outliers(words: List[dict]) -> Tuple[float, float, float]:
-        """
-        1行内の文字/単語タイムスタンプ列から、
-        ・先頭1〜2文字だけが前の間奏やスキャットに引っ張られて孤立しているケース
-        ・末尾1〜2文字だけが後ろの間奏やスキャットに引っ張られて飛んでいるケース
-        を検出し、本隊クラスタの時刻に補正する。
-        戻り値: (line_start, line_end, last_char_start)
-        """
-        if not words:
-            return 0.0, 0.5, 0.0
-        if len(words) == 1:
-            s = float(words[0]["start"])
-            e = min(float(words[0]["end"]), s + 0.9)
-            return s, max(s + 0.2, e), s
-
-        # 先頭側の孤立ジャンプ検査（先頭35%以内のどこかに 0.75秒以上の不自然な空白があるか）
-        n = len(words)
-        head_limit = max(1, int(n * 0.35))
-        cluster_start_idx = 0
-        for i in range(head_limit):
-            gap = float(words[i + 1]["start"]) - float(words[i]["end"])
-            dur_i = float(words[i]["end"]) - float(words[i]["start"])
-            if gap >= 0.75 or dur_i >= 1.6:
-                cluster_start_idx = i + 1
-
-        if cluster_start_idx > 0:
-            # 先頭文字を本隊クラスタの直前（1文字あたり0.13秒）に引き戻す
-            anchor = float(words[cluster_start_idx]["start"])
-            char_count_before = sum(len(w.get("word", "").strip()) or 1 for w in words[:cluster_start_idx])
-            line_start = max(0.0, anchor - char_count_before * 0.13)
-        else:
-            # 1文字目自体が異常に長く前に伸びている場合も補正
-            w0_s, w0_e = float(words[0]["start"]), float(words[0]["end"])
-            if w0_e - w0_s > 0.75 and n >= 2:
-                line_start = max(w0_s, w0_e - 0.22)
-            else:
-                line_start = w0_s
-
-        # 末尾側の孤立ジャンプ検査（後半65%以降で 0.85秒以上の空白を挟んで後ろに飛んでいるか）
-        tail_start_idx = max(cluster_start_idx, int(n * 0.65) - 1)
-        valid_end_idx = n - 1
-        for i in range(tail_start_idx, n - 1):
-            gap = float(words[i + 1]["start"]) - float(words[i]["end"])
-            if gap >= 0.85:
-                valid_end_idx = i
-                break
-
-        last_w = words[valid_end_idx]
-        last_char_start = max(line_start, float(last_w["start"]))
-        line_end = max(last_char_start + 0.18, float(last_w["end"]))
-        return line_start, line_end, last_char_start
-
     def generate(
         self,
         audio_path: str,
@@ -355,21 +264,22 @@ class LRCMakerEngine:
         lang: str = "ja",
         use_demucs: bool = False,
         ignore_scat: bool = True,
-        interlude_gap: float = 0.65,
+        interlude_gap: float = 0.60,
         interlude_tag: str = "[間奏]",
         lead_offset: float = 0.0,
         max_char_tail: float = 0.90,
     ) -> dict:
         """
-        音源と歌詞テキストからLRC文字列および詳細タイムスタンプ情報を生成する
+        音源からWhisperで高精度トランスクリプション（VAD/無音抑制付き）を行い、
+        ユーザーの歌詞テキストと動的シーケンスマッチングで各行の歌い始め・歌い終わりを確定する。
+        これにより、イントロや伴奏でDTWがスキップされて曲末尾に固まる現象を100%防止し、
+        歌詞にないスキャットを自動スルーする。
         """
         raw_rows = [r.strip() for r in lyrics_text.replace("\r", "").split("\n")]
-        # 空行やコメント、既存のLRCタグをクリーニングしつつ行リストを作成
         lyric_lines: List[str] = []
         for r in raw_rows:
             if not r or r.startswith("#"):
                 continue
-            # 既存の [mm:ss.xx] タグがあれば剥がす
             cleaned = re.sub(r"^\[\d+:\d+(?:[.:]\d+)?\]\s*", "", r).strip()
             if not cleaned or re.match(r"^\[\s*(間奏|interlude|inst).*\]$", cleaned, re.I):
                 continue
@@ -378,122 +288,187 @@ class LRCMakerEngine:
         if not lyric_lines:
             raise ValueError("有効な歌詞行がありません。")
 
-        demucs_wav = None
-        try:
-            target_audio_path = audio_path
-            if use_demucs:
-                demucs_wav = separate_vocals_demucs(audio_path)
-                if demucs_wav:
-                    target_audio_path = demucs_wav
+        # 1. 音響解析用信号（RMSエンベロープ）の取得
+        raw_16k, vocal_band_16k, sr = load_audio_mono_16k(audio_path)
+        rms, dt = compute_rms_envelope(vocal_band_16k, sr=sr, hop_ms=10, win_ms=30)
+        audio_duration = round(len(raw_16k) / sr, 2)
 
-            raw_16k, vocal_band_16k, sr = load_audio_mono_16k(target_audio_path)
-            rms, dt = compute_rms_envelope(vocal_band_16k, sr=sr, hop_ms=10, win_ms=30)
+        # 2. Whisper によるトランスクリプション実行
+        # 歌詞の冒頭を initial_prompt に渡して漢字や発音の認識率を最大化
+        prompt_plain = " ".join([ln.replace("/", "") for ln in lyric_lines[:20]])
+        prompt_text = "歌詞: " + prompt_plain[:240]
 
-            align_audio = raw_16k
-            scat_regions = []
-            if ignore_scat:
-                align_audio, scat_regions = self.mask_scats(raw_16k, lyric_lines, lang=lang)
+        transcribe_opts = {
+            "language": lang,
+            "initial_prompt": prompt_text,
+            "word_timestamps": True,
+            "suppress_silence": True,
+            "vad": True,
+            "verbose": False,
+        }
+        if use_demucs:
+            try:
+                transcribe_opts["demucs"] = True
+            except Exception:
+                pass
 
-            # アライメント実行（行区切りを保持するため改行結合で渡す）
-            # ※ JIZURA用のカット区切り '/' はアライメント時には邪魔にならないよう一時除去し、後で復元可能にする
-            plain_lines = [ln.replace("/", "") for ln in lyric_lines]
-            joined_text = "\n".join(plain_lines)
+        print(f"[LRC Maker] Transcribing audio with Whisper (VAD=True)...")
+        asr_res = self.model.transcribe(audio_path, **transcribe_opts)
 
-            result = self.model.align(
-                align_audio,
-                joined_text,
-                language=lang,
-                vad=True,
-                suppress_silence=True,
-                suppress_word_ts=True,
-                original_split=True,
-                verbose=False,
+        # 3. 認識された単語列のフラット化
+        asr_words: List[dict] = []
+        for seg in asr_res.segments:
+            if seg.words:
+                for w in seg.words:
+                    w_txt = (w.word or "").strip()
+                    if w_txt:
+                        asr_words.append({
+                            "word": w_txt,
+                            "start": round(float(w.start), 3),
+                            "end": round(float(w.end), 3),
+                            "used": False,
+                        })
+            else:
+                seg_txt = (seg.text or "").strip()
+                if seg_txt:
+                    asr_words.append({
+                        "word": seg_txt,
+                        "start": round(float(seg.start), 3),
+                        "end": round(float(seg.end), 3),
+                        "used": False,
+                    })
+
+        if not asr_words:
+            # 万が一無音などで検出されなかった場合、均等配分フォールバック
+            step = audio_duration / (len(lyric_lines) + 1)
+            asr_words = [
+                {"word": ln, "start": (i + 1) * step, "end": (i + 1) * step + step * 0.7, "used": False}
+                for i, ln in enumerate(lyric_lines)
+            ]
+
+        # 4. 歌詞行と認識単語列のシーケンシャル最適アライメント
+        cur_word_idx = 0
+        raw_aligned: List[dict] = []
+
+        for line_idx, raw_line in enumerate(lyric_lines):
+            clean_line = raw_line.replace("/", "").strip()
+            target = normalize_for_match(clean_line)
+            if not target:
+                target = clean_line.lower()
+
+            best_score = -1.0
+            best_range = (cur_word_idx, cur_word_idx)
+
+            # 現在位置から先の単語ウィンドウ内で最も一致率が高い区間を探す
+            max_search = min(len(asr_words), cur_word_idx + 45)
+            for i in range(cur_word_idx, max_search):
+                concat = ""
+                for j in range(i, min(len(asr_words), i + 18)):
+                    concat += normalize_for_match(asr_words[j]["word"])
+                    sm = difflib.SequenceMatcher(None, target, concat)
+                    score = sm.ratio()
+                    if score > best_score:
+                        best_score = score
+                        best_range = (i, j)
+                    # 充分に高く文字数も満たしていれば探索早期終了
+                    if score >= 0.88 and len(concat) >= len(target) * 0.85:
+                        break
+                if best_score >= 0.95:
+                    break
+
+            # 一致スコアが基準値以上の場合はその区間を採用、スキャット等はスキップされる
+            if best_score >= 0.28 and best_range[0] < len(asr_words):
+                s_idx, e_idx = best_range
+                s_time = asr_words[s_idx]["start"]
+                e_time = asr_words[e_idx]["end"]
+                # 使用した単語にマーク
+                for k in range(s_idx, e_idx + 1):
+                    asr_words[k]["used"] = True
+                cur_word_idx = e_idx + 1
+            else:
+                # ASRが聞き落とした行は、直前の終了時刻から自然に推定
+                prev_end = raw_aligned[-1]["end"] if raw_aligned else 1.5
+                s_time = prev_end + 0.35
+                e_time = s_time + max(1.2, len(clean_line) * 0.20)
+
+            raw_aligned.append({
+                "index": line_idx,
+                "text": raw_line,
+                "start": round(s_time, 3),
+                "end": round(max(s_time + 0.20, e_time), 3),
+                "score": best_score,
+            })
+
+        # 単調増加の保証（前の行より時間が戻らない）
+        for i in range(1, len(raw_aligned)):
+            prev_s = raw_aligned[i - 1]["start"]
+            if raw_aligned[i]["start"] < prev_s + 0.08:
+                raw_aligned[i]["start"] = round(prev_s + 0.08, 3)
+                raw_aligned[i]["end"] = max(raw_aligned[i]["start"] + 0.25, raw_aligned[i]["end"])
+
+        # 5. 各行の歌い終わり（リリース）をボーカルRMSで精密調整
+        aligned_lines: List[AlignedLine] = []
+        for i, item in enumerate(raw_aligned):
+            s = item["start"]
+            e = item["end"]
+            next_s = raw_aligned[i + 1]["start"] if i + 1 < len(raw_aligned) else None
+            # 語尾の1文字の開始位置を推定
+            last_cs = max(s, e - min(max_char_tail, 0.45))
+            ref_s, ref_e = refine_line_bounds_with_rms(
+                start_sec=s,
+                end_sec=e,
+                last_char_start=last_cs,
+                next_line_start=next_s,
+                rms=rms,
+                dt=dt,
+                max_tail_char_dur=max_char_tail,
+            )
+            ref_s = max(0.0, ref_s + lead_offset)
+            ref_e = max(ref_s + 0.15, ref_e + lead_offset)
+            aligned_lines.append(
+                AlignedLine(
+                    index=i,
+                    text=item["text"],
+                    start=round(ref_s, 2),
+                    end=round(ref_e, 2),
+                    words=[],
+                )
             )
 
-            segments = result.segments
-            raw_aligned: List[Tuple[float, float, float, List[dict]]] = []
+        # 6. スルーされたスキャット（歌詞とマッチしなかった単語区間）の収集
+        scat_regions: List[dict] = []
+        if ignore_scat:
+            for w in asr_words:
+                if not w["used"]:
+                    scat_regions.append({
+                        "start": w["start"],
+                        "end": w["end"],
+                        "text": w["word"],
+                    })
 
-            for idx, ln_text in enumerate(lyric_lines):
-                if idx < len(segments):
-                    seg = segments[idx]
-                    w_list = [
-                        {"word": w.word, "start": round(float(w.start), 3), "end": round(float(w.end), 3)}
-                        for w in (seg.words or [])
-                    ]
-                    if w_list:
-                        s, e, last_cs = self.fix_line_outliers(w_list)
-                    else:
-                        s = float(seg.start)
-                        e = float(seg.end)
-                        last_cs = max(s, e - 0.3)
-                else:
-                    prev_e = raw_aligned[-1][1] if raw_aligned else 0.0
-                    s, e, last_cs = prev_e + 0.5, prev_e + 2.5, prev_e + 2.2
-                    w_list = []
+        # 7. LRC文字列の生成（歌っていない区間に [間奏] を自動挿入）
+        lrc_rows: List[str] = []
+        if aligned_lines and aligned_lines[0].start >= max(1.2, interlude_gap):
+            lrc_rows.append(f"[00:00.00]{interlude_tag}")
 
-                raw_aligned.append((s, e, last_cs, w_list))
-
-            # 単調増加（前の行より巻き戻らない）保証
-            for i in range(1, len(raw_aligned)):
-                prev_s = raw_aligned[i - 1][0]
-                s, e, lcs, wl = raw_aligned[i]
-                if s < prev_s + 0.08:
-                    s = prev_s + 0.08
-                    e = max(s + 0.25, e)
-                    lcs = max(s, min(lcs, e - 0.1))
-                    raw_aligned[i] = (s, e, lcs, wl)
-
-            # 各行の歌い終わり（リリース）をボーカル帯域RMSで精密調整
-            aligned_lines: List[AlignedLine] = []
-            for i, (s, e, lcs, wl) in enumerate(raw_aligned):
-                next_s = raw_aligned[i + 1][0] if i + 1 < len(raw_aligned) else None
-                ref_s, ref_e = refine_line_bounds_with_rms(
-                    start_sec=s,
-                    end_sec=e,
-                    last_char_start=lcs,
-                    next_line_start=next_s,
-                    rms=rms,
-                    dt=dt,
-                    max_tail_char_dur=max_char_tail,
-                )
-                ref_s = max(0.0, ref_s + lead_offset)
-                ref_e = max(ref_s + 0.15, ref_e + lead_offset)
-                aligned_lines.append(
-                    AlignedLine(
-                        index=i,
-                        text=lyric_lines[i],
-                        start=ref_s,
-                        end=ref_e,
-                        words=wl,
-                    )
-                )
-
-            # LRC文字列の組み立て（歌っていない区間に [間奏] または空行を挿入）
-            lrc_rows: List[str] = []
-            if aligned_lines and aligned_lines[0].start >= max(1.2, interlude_gap):
-                lrc_rows.append(f"[00:00.00]{interlude_tag}")
-
-            for i, al in enumerate(aligned_lines):
-                lrc_rows.append(f"[{fmt_lrc_time(al.start)}]{al.text}")
-                next_start = aligned_lines[i + 1].start if i + 1 < len(aligned_lines) else None
-                if next_start is not None:
-                    gap = next_start - al.end
-                    if gap >= interlude_gap:
-                        lrc_rows.append(f"[{fmt_lrc_time(al.end)}]{interlude_tag}")
-                else:
-                    # 最終行の歌い終わりにも間奏（終了マーカー）を入れてアウトロでの間延びを防ぐ
+        for i, al in enumerate(aligned_lines):
+            lrc_rows.append(f"[{fmt_lrc_time(al.start)}]{al.text}")
+            next_start = aligned_lines[i + 1].start if i + 1 < len(aligned_lines) else None
+            if next_start is not None:
+                gap = next_start - al.end
+                if gap >= interlude_gap:
                     lrc_rows.append(f"[{fmt_lrc_time(al.end)}]{interlude_tag}")
+            else:
+                # 最終行の歌い終わりにも間奏マーカーを入れてアウトロの間延びを防止
+                lrc_rows.append(f"[{fmt_lrc_time(al.end)}]{interlude_tag}")
 
-            lrc_text = "\n".join(lrc_rows) + "\n"
-            return {
-                "lrc": lrc_text,
-                "lines": [asdict(a) for a in aligned_lines],
-                "scats_ignored": scat_regions,
-                "duration": round(len(raw_16k) / sr, 2),
-            }
-        finally:
-            if demucs_wav and os.path.exists(demucs_wav):
-                shutil.rmtree(os.path.dirname(os.path.dirname(demucs_wav)), ignore_errors=True)
+        lrc_text = "\n".join(lrc_rows) + "\n"
+        return {
+            "lrc": lrc_text,
+            "lines": [asdict(a) for a in aligned_lines],
+            "scats_ignored": scat_regions[:30],  # UI表示用に最大30件
+            "duration": audio_duration,
+        }
 
 
 def fmt_lrc_time(sec: float) -> str:
