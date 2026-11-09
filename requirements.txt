@@ -1,0 +1,8 @@
+torch>=2.5.0
+torchaudio>=2.5.0
+stable-ts>=2.17.0
+openai-whisper>=20240930
+scipy>=1.11.0
+soundfile>=0.12.0
+demucs>=4.0.0
+numpy>=1.24.0
